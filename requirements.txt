@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+youtube-transcript-api
+pydantic
+sqlalchemy
+psycopg2-binary
+python-dotenv
+cryptography
+sqlalchemyfaiss-cpu
+sentence-transformers
+numpy

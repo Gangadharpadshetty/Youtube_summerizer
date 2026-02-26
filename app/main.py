@@ -1,26 +1,21 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
-from app.services import youtube_service as ys
+from fastapi.middleware.gzip import GZipMiddleware
 
-app = FastAPI(title="YouTube Video Transcriptor API")
-
-
-class TranscriptRequest(BaseModel):
-    youtube_url: str
+from app.api.process_video import router as process_video
+from app.api.retrieve_chunks import router as retrieve_chunks_router
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
+app = FastAPI(
+    title="YouTube RAG Backend API",
+    version="3.0.0",
+    description="Storage and retrieval layer for OpenClaw YouTube assistant"
+)
 
-@app.post("/transcript")
-def get_transcript(request: TranscriptRequest):
-    video_id = extract_video_id(request.youtube_url)
-    transcript, language = fetch_transcript(video_id)
+# Middleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-    return {
-        "video_id": video_id,
-        "language": language,
-        "transcript": transcript
-    }
+# Routers
+# app.include_router(health_router)
+app.include_router(process_video)
+app.include_router(retrieve_chunks_router)

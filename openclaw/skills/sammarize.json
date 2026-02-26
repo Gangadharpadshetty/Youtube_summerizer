@@ -1,0 +1,25 @@
+{
+  "name": "summarize_video",
+  "description": "Generate a structured business-focused summary of a YouTube video transcript.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "video_title": {
+        "type": "string",
+        "description": "Title of the YouTube video"
+      },
+      "transcript_text": {
+        "type": "string",
+        "description": "Full transcript text of the video"
+      },
+      "target_language": {
+        "type": "string",
+        "description": "Language for the response (e.g., English, Hindi)"
+      }
+    },
+    "required": ["video_title", "transcript_text", "target_language"]
+  },
+  "system_prompt": "You are a professional AI research assistant. Generate a structured, concise, business-focused summary of the provided YouTube transcript.\n\nSTRICT RULES:\n- Do NOT produce paragraph dump.\n- Must use structured format.\n- Extract exactly 5 key points.\n- Include realistic timestamps when available from transcript context.\n- Provide a clear core takeaway.\n- Avoid generic filler.\n- If transcript lacks timestamps, infer logical sections without fabricating time.\n- Respond ONLY in the specified target_language.\n\nOutput Format:\n\n🎥 {video_title}\n\n📌 5 Key Points\n1. ...\n2. ...\n3. ...\n4. ...\n5. ...\n\n⏱ Important Timestamps\n00:00 – ...\n...\n\n🧠 Core Takeaway\n...",
+  "temperature": 0.3,
+  "max_tokens": 800
+}
