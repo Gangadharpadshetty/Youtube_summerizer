@@ -137,4 +137,4 @@ class TestConcurrency:
             t.join()
 
         for i in range(30):
-            assert get_active_video(f"user_{i}") == f"vid_{i}"= f"vid_{i}"
+            assert get_active_video(f"user_{i}") == f"vid_{i}"== f"vid_{i}"

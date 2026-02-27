@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 from unittest.mock import patch, MagicMock
-from embedding_service import EmbeddingService
+from app.services.embedding_service import EmbeddingService
 
 
 @pytest.fixture
