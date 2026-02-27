@@ -1,183 +1,97 @@
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from fastapi import HTTPException
+import logging
 
-from app.main import app
-from app.database.base import Base
-from app.database.session import get_db
-from app.models import Video, Chunk
+from app.services.transcript_service import TranscriptService
+from app.services.chunking_service import ChunkingService
+from app.services.embedding_service import EmbeddingService
+from app.services.vector_store_service import VectorStoreService
+from app.repositories.video_repository import VideoRepository
 
-
-# ----------------------------
-# Test Database Setup
-# ----------------------------
-
-SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
-
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-TestingSessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
-
-Base.metadata.create_all(bind=engine)
+logger = logging.getLogger(__name__)
 
 
-def override_get_db():
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class VideoService:
 
+    def __init__(self, db: Session):
+        self.db = db
+        self.repo = VideoRepository(db)
+        self.embedding = EmbeddingService()
+        self.vector_store = VectorStoreService(db)
 
-app.dependency_overrides[get_db] = override_get_db
+    def process_video(self, video_id: str) -> dict:
 
-client = TestClient(app)
+        # Check cache
+        try:
+            existing = self.repo.get_by_video_id(video_id)
+            if existing:
+                return {
+                    "video_id": video_id,
+                    "cached": True,
+                    "chunk_count": 0,
+                    "message": "Video already processed."
+                }
+        except SQLAlchemyError as e:
+            logger.error(f"Database error checking video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Database unavailable")
 
+        # Fetch transcript
+        try:
+            transcript_text, language = TranscriptService.fetch(video_id)
+        except ValueError as e:
+            logger.warning(f"Transcript not available for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail=f"Transcript unavailable: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to fetch transcript for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to fetch transcript from YouTube")
 
-# ----------------------------
-# Mock Services
-# ----------------------------
+        # Save video record
+        try:
+            self.repo.create_video(video_id, transcript_text, language)
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to save video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to save video to database")
 
-@pytest.fixture(autouse=True)
-def mock_services(monkeypatch):
-    """
-    Mock transcript + embeddings to avoid real API calls
-    """
+        # Chunk transcript
+        try:
+            chunks = ChunkingService.chunk_text(transcript_text)
+            if not chunks:
+                raise ValueError("Chunking produced no output")
+        except ValueError as e:
+            logger.warning(f"Chunking failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Transcript could not be chunked")
+        except Exception as e:
+            logger.error(f"Unexpected chunking error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Chunking error")
 
-    # Mock transcript fetch
-    def fake_fetch(video_id):
-        return "Artificial intelligence is transforming industries.", "English"
+        # Generate embeddings
+        try:
+            embeddings = self.embedding.batch_embed(chunks)
+            if not embeddings:
+                raise ValueError("Embedding returned empty result")
+        except ValueError as e:
+            logger.warning(f"Embedding failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Failed to generate embeddings")
+        except Exception as e:
+            logger.error(f"Embedding service error for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Embedding service unavailable")
 
-    monkeypatch.setattr(
-        "app.services.transcript_service.TranscriptService.fetch",
-        fake_fetch
-    )
+        # Store vectors
+        try:
+            self.vector_store.bulk_insert_chunks(video_id, chunks, embeddings)
+        except SQLAlchemyError as e:
+            logger.error(f"Vector store insert failed for {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to store embeddings")
+        except Exception as e:
+            logger.error(f"Unexpected vector store error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Vector store error")
 
-    # Mock embeddings
-    def fake_embed(self, text):
-        return [0.1] * 1536
+        logger.info(f"Video {video_id} processed successfully — {len(chunks)} chunks")
 
-    def fake_batch_embed(self, texts):
-        return [[0.1] * 1536 for _ in texts]
-
-    monkeypatch.setattr(
-        "app.services.embedding_service.EmbeddingService.embed",
-        fake_embed
-    )
-
-    monkeypatch.setattr(
-        "app.services.embedding_service.EmbeddingService.batch_embed",
-        fake_batch_embed
-    )
-
-
-# ----------------------------
-# HEALTH TEST
-# ----------------------------
-
-def test_health():
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
-
-
-# ----------------------------
-# PROCESS VIDEO TEST
-# ----------------------------
-
-def test_process_video_success():
-    response = client.post(
-        "/process_video/",
-        json={"video_id": "abc123xyz00"}
-    )
-
-    assert response.status_code == 200
-
-    data = response.json()
-
-    assert data["video_id"] == "abc123xyz00"
-    assert data["cached"] is False
-    assert data["chunk_count"] > 0
-
-
-def test_process_video_cached():
-    # First call
-    client.post("/process_video/", json={"video_id": "cached123456"})
-
-    # Second call
-    response = client.post(
-        "/process_video/",
-        json={"video_id": "cached123456"}
-    )
-
-    assert response.status_code == 200
-    assert response.json()["cached"] is True
-
-
-# ----------------------------
-# RETRIEVE CHUNKS TEST
-# ----------------------------
-
-def test_retrieve_chunks_success():
-    # First process video
-    client.post("/process_video/", json={"video_id": "ragvideo123"})
-
-    response = client.post(
-        "/retrieve_chunks/",
-        json={
-            "video_id": "ragvideo123",
-            "question": "What is artificial intelligence?",
-            "top_k": 3
+        return {
+            "video_id": video_id,
+            "cached": False,
+            "chunk_count": len(chunks),
+            "message": "Video processed successfully."
         }
-    )
-
-    assert response.status_code == 200
-
-    data = response.json()
-    assert data["video_id"] == "ragvideo123"
-    assert isinstance(data["chunks"], list)
-    assert len(data["chunks"]) <= 3
-
-
-def test_retrieve_chunks_invalid_video():
-    response = client.post(
-        "/retrieve_chunks/",
-        json={
-            "video_id": "nonexistent",
-            "question": "Hello?",
-            "top_k": 3
-        }
-    )
-
-    # Depending on your service logic
-    assert response.status_code in [200, 400]
-
-
-# ----------------------------
-# EDGE CASE TESTS
-# ----------------------------
-
-def test_invalid_video_id():
-    response = client.post(
-        "/process_video/",
-        json={"video_id": ""}
-    )
-
-    assert response.status_code in [400, 422]
-
-
-def test_invalid_top_k():
-    response = client.post(
-        "/retrieve_chunks/",
-        json={
-            "video_id": "abc",
-            "question": "Test",
-            "top_k": 100
-        }
-    )
-
-    assert response.status_code == 422

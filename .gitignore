@@ -1,0 +1,4 @@
+.venv
+.env
+schema.sql
+DATABASE_SETUP.MD

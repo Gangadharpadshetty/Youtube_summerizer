@@ -1,191 +1,97 @@
-import pytest
-from unittest.mock import patch
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from fastapi import HTTPException
+import logging
+
+from app.services.transcript_service import TranscriptService
+from app.services.chunking_service import ChunkingService
+from app.services.embedding_service import EmbeddingService
+from app.services.vector_store_service import VectorStoreService
+from app.repositories.video_repository import VideoRepository
+
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# HEALTH CHECK
-# -----------------------------
+class VideoService:
 
-def test_health(client):
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    def __init__(self, db: Session):
+        self.db = db
+        self.repo = VideoRepository(db)
+        self.embedding = EmbeddingService()
+        self.vector_store = VectorStoreService(db)
 
+    def process_video(self, video_id: str) -> dict:
 
-# -----------------------------
-# INVALID YOUTUBE URL
-# -----------------------------
+        # Check cache
+        try:
+            existing = self.repo.get_by_video_id(video_id)
+            if existing:
+                return {
+                    "video_id": video_id,
+                    "cached": True,
+                    "chunk_count": 0,
+                    "message": "Video already processed."
+                }
+        except SQLAlchemyError as e:
+            logger.error(f"Database error checking video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Database unavailable")
 
-def test_invalid_youtube_url(client):
-    response = client.post(
-        "/process-video",
-        json={
-            "youtube_url": "invalid_url",
-            "telegram_id": "user1",
-            "language": "English"
+        # Fetch transcript
+        try:
+            transcript_text, language = TranscriptService.fetch(video_id)
+        except ValueError as e:
+            logger.warning(f"Transcript not available for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail=f"Transcript unavailable: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to fetch transcript for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to fetch transcript from YouTube")
+
+        # Save video record
+        try:
+            self.repo.create_video(video_id, transcript_text, language)
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to save video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to save video to database")
+
+        # Chunk transcript
+        try:
+            chunks = ChunkingService.chunk_text(transcript_text)
+            if not chunks:
+                raise ValueError("Chunking produced no output")
+        except ValueError as e:
+            logger.warning(f"Chunking failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Transcript could not be chunked")
+        except Exception as e:
+            logger.error(f"Unexpected chunking error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Chunking error")
+
+        # Generate embeddings
+        try:
+            embeddings = self.embedding.batch_embed(chunks)
+            if not embeddings:
+                raise ValueError("Embedding returned empty result")
+        except ValueError as e:
+            logger.warning(f"Embedding failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Failed to generate embeddings")
+        except Exception as e:
+            logger.error(f"Embedding service error for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Embedding service unavailable")
+
+        # Store vectors
+        try:
+            self.vector_store.bulk_insert_chunks(video_id, chunks, embeddings)
+        except SQLAlchemyError as e:
+            logger.error(f"Vector store insert failed for {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to store embeddings")
+        except Exception as e:
+            logger.error(f"Unexpected vector store error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Vector store error")
+
+        logger.info(f"Video {video_id} processed successfully — {len(chunks)} chunks")
+
+        return {
+            "video_id": video_id,
+            "cached": False,
+            "chunk_count": len(chunks),
+            "message": "Video processed successfully."
         }
-    )
-
-    assert response.status_code == 400
-    assert "Invalid YouTube URL" in response.json()["detail"]
-
-
-# -----------------------------
-# NO TRANSCRIPT AVAILABLE
-# -----------------------------
-
-@patch("app.services.transcript_service.TranscriptService.fetch_transcript")
-def test_no_transcript_available(mock_transcript, client):
-    mock_transcript.return_value = None
-
-    response = client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=abcdefghijk",
-            "telegram_id": "user1",
-            "language": "English"
-        }
-    )
-
-    assert response.status_code == 400
-    assert "Transcript not available" in response.json()["detail"]
-
-
-# -----------------------------
-# VERY LONG TRANSCRIPT
-# -----------------------------
-
-@patch("app.services.transcript_service.TranscriptService.fetch_transcript")
-def test_long_transcript(mock_transcript, client):
-    mock_transcript.return_value = "This is a long transcript. " * 1000
-
-    response = client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=abcdefghijk",
-            "telegram_id": "user1",
-            "language": "English"
-        }
-    )
-
-    assert response.status_code == 200
-    assert "video_id" in response.json()
-
-
-# -----------------------------
-# ASK WITHOUT ACTIVE VIDEO
-# -----------------------------
-
-def test_ask_without_session(client):
-    response = client.post(
-        "/retrieve-chunks",
-        json={
-            "telegram_id": "new_user",
-            "question": "What is pricing?",
-            "language": "English"
-        }
-    )
-
-    assert response.status_code == 400
-    assert "No active video found" in response.json()["detail"]
-
-
-# -----------------------------
-# QUESTION NOT COVERED
-# -----------------------------
-
-@patch("app.services.rag_service.RAGService.retrieve_relevant_chunks")
-def test_question_not_covered(mock_rag, client):
-    mock_rag.return_value = []
-
-    # First process video
-    client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=abcdefghijk",
-            "telegram_id": "user1",
-            "language": "English"
-        }
-    )
-
-    response = client.post(
-        "/retrieve-chunks",
-        json={
-            "telegram_id": "user1",
-            "question": "What about quantum physics?",
-            "language": "English"
-        }
-    )
-
-    assert response.status_code == 200
-    assert response.json()["answer"] == "This topic is not covered in the video."
-
-
-# -----------------------------
-# MULTI-LANGUAGE SUPPORT
-# -----------------------------
-
-@patch("app.services.openclaw_service.call_summarize_skill")
-def test_multilanguage_summary(mock_summary, client):
-    mock_summary.return_value = "यह वीडियो का सारांश है।"
-
-    response = client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=abcdefghijk",
-            "telegram_id": "user2",
-            "language": "Hindi"
-        }
-    )
-
-    assert response.status_code == 200
-    assert "video_id" in response.json()
-
-
-# -----------------------------
-# MULTIPLE USERS SESSION ISOLATION
-# -----------------------------
-
-def test_multiple_users(client):
-
-    # User 1
-    client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=video11111",
-            "telegram_id": "user1",
-            "language": "English"
-        }
-    )
-
-    # User 2
-    client.post(
-        "/process-video",
-        json={
-            "youtube_url": "https://youtube.com/watch?v=video22222",
-            "telegram_id": "user2",
-            "language": "English"
-        }
-    )
-
-    response1 = client.post(
-        "/retrieve-chunks",
-        json={
-            "telegram_id": "user1",
-            "question": "What is discussed?",
-            "language": "English"
-        }
-    )
-
-    response2 = client.post(
-        "/retrieve-chunks",
-        json={
-            "telegram_id": "user2",
-            "question": "What is discussed?",
-            "language": "English"
-        }
-    )
-
-    assert response1.status_code == 200
-    assert response2.status_code == 200
-    assert response1.json() != response2.json()

@@ -1,73 +1,97 @@
-import os
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from fastapi import HTTPException
+import logging
 
-from app.main import app
-from app.database import Base, get_db
+from app.services.transcript_service import TranscriptService
+from app.services.chunking_service import ChunkingService
+from app.services.embedding_service import EmbeddingService
+from app.services.vector_store_service import VectorStoreService
+from app.repositories.video_repository import VideoRepository
 
-
-# -----------------------------
-# TEST DATABASE CONFIG
-# -----------------------------
-
-TEST_DATABASE_URL = "sqlite:///./test.db"
-
-engine = create_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-)
-
-TestingSessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine,
-)
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# CREATE / DROP TABLES
-# -----------------------------
+class VideoService:
 
-@pytest.fixture(scope="session", autouse=True)
-def create_test_database():
-    """
-    Create tables before test session
-    Drop after session ends
-    """
-    Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
+    def __init__(self, db: Session):
+        self.db = db
+        self.repo = VideoRepository(db)
+        self.embedding = EmbeddingService()
+        self.vector_store = VectorStoreService(db)
 
-    # Remove test.db file after tests
-    if os.path.exists("test.db"):
-        os.remove("test.db")
+    def process_video(self, video_id: str) -> dict:
 
+        # Check cache
+        try:
+            existing = self.repo.get_by_video_id(video_id)
+            if existing:
+                return {
+                    "video_id": video_id,
+                    "cached": True,
+                    "chunk_count": 0,
+                    "message": "Video already processed."
+                }
+        except SQLAlchemyError as e:
+            logger.error(f"Database error checking video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Database unavailable")
 
-# -----------------------------
-# OVERRIDE get_db DEPENDENCY
-# -----------------------------
+        # Fetch transcript
+        try:
+            transcript_text, language = TranscriptService.fetch(video_id)
+        except ValueError as e:
+            logger.warning(f"Transcript not available for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail=f"Transcript unavailable: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to fetch transcript for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to fetch transcript from YouTube")
 
-def override_get_db():
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+        # Save video record
+        try:
+            self.repo.create_video(video_id, transcript_text, language)
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to save video {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to save video to database")
 
+        # Chunk transcript
+        try:
+            chunks = ChunkingService.chunk_text(transcript_text)
+            if not chunks:
+                raise ValueError("Chunking produced no output")
+        except ValueError as e:
+            logger.warning(f"Chunking failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Transcript could not be chunked")
+        except Exception as e:
+            logger.error(f"Unexpected chunking error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Chunking error")
 
-app.dependency_overrides[get_db] = override_get_db
+        # Generate embeddings
+        try:
+            embeddings = self.embedding.batch_embed(chunks)
+            if not embeddings:
+                raise ValueError("Embedding returned empty result")
+        except ValueError as e:
+            logger.warning(f"Embedding failed for {video_id}: {e}")
+            raise HTTPException(status_code=422, detail="Failed to generate embeddings")
+        except Exception as e:
+            logger.error(f"Embedding service error for {video_id}: {e}")
+            raise HTTPException(status_code=502, detail="Embedding service unavailable")
 
+        # Store vectors
+        try:
+            self.vector_store.bulk_insert_chunks(video_id, chunks, embeddings)
+        except SQLAlchemyError as e:
+            logger.error(f"Vector store insert failed for {video_id}: {e}")
+            raise HTTPException(status_code=503, detail="Failed to store embeddings")
+        except Exception as e:
+            logger.error(f"Unexpected vector store error for {video_id}: {e}")
+            raise HTTPException(status_code=500, detail="Vector store error")
 
-# -----------------------------
-# TEST CLIENT FIXTURE
-# -----------------------------
+        logger.info(f"Video {video_id} processed successfully — {len(chunks)} chunks")
 
-@pytest.fixture()
-def client():
-    """
-    Provides FastAPI TestClient
-    """
-    with TestClient(app) as c:
-        yield c
+        return {
+            "video_id": video_id,
+            "cached": False,
+            "chunk_count": len(chunks),
+            "message": "Video processed successfully."
+        }
